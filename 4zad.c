@@ -9,15 +9,16 @@
 #include <sys/select.h>
 #include <sys/ioctl.h>
 
+/* Linked list required by assignment 4. */
 struct node {
     char *text;
     struct node *next;
 };
 
-static volatile sig_atomic_t interrupted = 0;
-static void on_signal(int sig) { interrupted = sig; }
+static volatile sig_atomic_t stop_signal = 0;
+static void signal_handler(int signum) { stop_signal = signum; }
 
-static void free_list(struct node *head)
+static void release_list(struct node *head)
 {
     while (head) {
         struct node *next = head->next;
@@ -27,70 +28,68 @@ static void free_list(struct node *head)
     }
 }
 
-static int reserve(char **buf, size_t *cap, size_t need)
+static int ensure_space(char **p, size_t *cap, size_t need)
 {
     if (need <= *cap) return 0;
-    size_t new_cap = *cap ? *cap : 64;
-    while (new_cap < need) {
-        if (new_cap > (size_t)-1 / 2) return -1;
-        new_cap *= 2;
+    size_t n = *cap ? *cap : 64;
+    while (n < need) {
+        if (n > (size_t)-1 / 2) return -1;
+        n *= 2;
     }
-    char *p = realloc(*buf, new_cap);
-    if (!p) return -1;
-    *buf = p;
-    *cap = new_cap;
+    char *q = realloc(*p, n);
+    if (!q) return -1;
+    *p = q;
+    *cap = n;
     return 0;
 }
 
-/* One UTF-8 character is one cursor step (Cyrillic works too). */
-static size_t prev_char(const char *s, size_t pos)
+static int output(const char *data, size_t n)
+{
+    while (n) {
+        ssize_t w = write(STDOUT_FILENO, data, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        data += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* Treat a UTF-8 code point as a cursor step; ASCII works as usual. */
+static size_t next_cp(const char *s, size_t len, size_t pos)
+{
+    if (pos >= len) return len;
+    ++pos;
+    while (pos < len && ((unsigned char)s[pos] & 0xc0) == 0x80) ++pos;
+    return pos;
+}
+
+static size_t previous_cp(const char *s, size_t pos)
 {
     if (!pos) return 0;
-    pos--;
-    while (pos && ((unsigned char)s[pos] & 0xc0) == 0x80) pos--;
+    --pos;
+    while (pos && ((unsigned char)s[pos] & 0xc0) == 0x80) --pos;
     return pos;
 }
 
-static size_t next_char(const char *s, size_t len, size_t pos)
-{
-    if (pos == len) return len;
-    pos++;
-    while (pos < len && ((unsigned char)s[pos] & 0xc0) == 0x80) pos++;
-    return pos;
-}
-
-static size_t chars(const char *s, size_t len)
+static size_t cp_count(const char *s, size_t len)
 {
     size_t n = 0;
-    for (size_t i = 0; i < len; i++)
-        if (((unsigned char)s[i] & 0xc0) != 0x80) n++;
+    for (size_t i = 0; i < len; i = next_cp(s, len, i)) ++n;
     return n;
 }
 
-static int write_all(const char *s, size_t n)
+static size_t byte_at_cp(const char *s, size_t len, size_t index)
 {
-    while (n) {
-        ssize_t r = write(STDOUT_FILENO, s, n);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;
-        s += r;
-        n -= (size_t)r;
-    }
-    return 0;
+    size_t i = 0;
+    while (index && i < len) { i = next_cp(s, len, i); --index; }
+    return i;
 }
 
-/* Screen position for a line, with one spare column to prevent auto-wrap. */
-static size_t visual_row(size_t n, size_t width)
+static size_t terminal_width(void)
 {
-    return n ? (n - 1) / width : 0;
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 20)
+        return ws.ws_col;
+    return 80;
 }
-
-static size_t visual_col(size_t n, size_t width)
-{
-    return n ? ((n - 1) % width) + 1 : 0;
-}
-
-static void restore_line_origin(size_t cursor_row)
-{
-    char esc[64];
-    write_all("\r", 1);
