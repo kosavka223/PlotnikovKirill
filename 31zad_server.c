@@ -158,3 +158,12 @@ int main(void)
         }
         for (i = 1; i <= MAX_CLIENTS; ++i)
             if (p[i].fd >= 0 &&
+                (p[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
+                read_client(&p[i]);
+    }
+    for (i = 1; i <= MAX_CLIENTS; ++i)
+        if (p[i].fd >= 0)
+            close(p[i].fd);
+    close(server);
+    return 0;
+}
