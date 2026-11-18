@@ -94,3 +94,123 @@ static int scan_clients(int clients[MAX_CLIENTS])
             changed = 1; /* Retry on the next scan. */
         } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
             perror("client read");
+            close(clients[i]);
+            clients[i] = -1;
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
+static void drain_sockets(int server, int clients[MAX_CLIENTS])
+{
+    int client, i, slot;
+
+    /* Listener is nonblocking: accept all pending connections. */
+    for (;;) {
+        client = accept(server, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                perror("accept");
+            break;
+        }
+        slot = -1;
+        for (i = 0; i < MAX_CLIENTS; ++i)
+            if (clients[i] == -1) {
+                slot = i;
+                break;
+            }
+        if (slot == -1 || enable_async(client) == -1) {
+            fprintf(stderr, "Client limit or async setup error\n");
+            close(client);
+        } else {
+            clients[slot] = client;
+        }
+    }
+
+    /* Round-robin: at most one chunk per client per pass. */
+    while (!stopping && scan_clients(clients))
+        ;
+}
+
+int main(void)
+{
+    struct sockaddr_un addr;
+    struct sigaction sa;
+    sigset_t block, previous, wait_mask;
+    int server, clients[MAX_CLIENTS], i;
+
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    if (snprintf(socket_file, sizeof socket_file,
+                 "/tmp/hw32_%lu.sock", (unsigned long)getuid()) >=
+        (int)sizeof socket_file) {
+        fprintf(stderr, "Socket path too long\n");
+        return 1;
+    }
+    strcpy(addr.sun_path, socket_file);
+
+    /* Block the signals while examining sockets: avoids lost wake-ups. */
+    sigemptyset(&block);
+    sigaddset(&block, SIGIO);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &block, &previous) == -1) {
+        perror("sigprocmask");
+        return 1;
+    }
+    wait_mask = previous;
+    sigdelset(&wait_mask, SIGIO);
+    sigdelset(&wait_mask, SIGINT);
+    sigdelset(&wait_mask, SIGTERM);
+
+    memset(&sa, 0, sizeof sa);
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = on_io;
+    if (sigaction(SIGIO, &sa, NULL) == -1) {
+        perror("sigaction SIGIO");
+        return 1;
+    }
+    sa.sa_handler = on_stop;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    server = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server == -1) {
+        perror("socket");
+        return 1;
+    }
+    unlink(socket_file);
+    if (bind(server, (struct sockaddr *)&addr, sizeof addr) == -1 ||
+        listen(server, MAX_CLIENTS) == -1 || enable_async(server) == -1) {
+        perror("bind/listen/enable_async");
+        close(server);
+        return 1;
+    }
+    bound = 1;
+    atexit(cleanup);
+    for (i = 0; i < MAX_CLIENTS; ++i)
+        clients[i] = -1;
+
+    printf("Server 32 listening: %s (SIGIO, %d clients)\n",
+           socket_file, MAX_CLIENTS);
+    fflush(stdout);
+
+    while (!stopping) {
+        if (io_ready) {
+            io_ready = 0;
+            drain_sockets(server, clients);
+        }
+        if (!stopping)
+            sigsuspend(&wait_mask); /* Atomically unblock and await SIGIO. */
+    }
+
+    for (i = 0; i < MAX_CLIENTS; ++i)
+        if (clients[i] != -1)
+            close(clients[i]);
+    close(server);
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return 0;
+}
