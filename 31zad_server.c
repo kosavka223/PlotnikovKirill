@@ -94,3 +94,67 @@ int main(void)
     }
     strcpy(addr.sun_path, socket_file);
     server = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server == -1) {
+        perror("socket");
+        return 1;
+    }
+    unlink(socket_file);
+    if (bind(server, (struct sockaddr *)&addr, sizeof addr) == -1 ||
+        listen(server, MAX_CLIENTS) == -1 || nonblock(server) == -1) {
+        perror("bind/listen/nonblock");
+        close(server);
+        return 1;
+    }
+    bound = 1;
+    atexit(cleanup);
+
+    memset(&sa, 0, sizeof sa);
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = stop_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    for (i = 0; i <= MAX_CLIENTS; ++i) {
+        p[i].fd = -1;
+        p[i].events = POLLIN;
+        p[i].revents = 0;
+    }
+    p[0].fd = server;
+    printf("Server 31 listening: %s (poll, %d clients)\n",
+           socket_file, MAX_CLIENTS);
+    fflush(stdout);
+
+    while (!stopping) {
+        rc = poll(p, MAX_CLIENTS + 1, -1);
+        if (rc == -1) {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            break;
+        }
+        if (p[0].revents & POLLIN) {
+            for (;;) {
+                client = accept(server, NULL, NULL);
+                if (client == -1) {
+                    if (errno == EINTR)
+                        continue;
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                        perror("accept");
+                    break;
+                }
+                slot = -1;
+                for (i = 1; i <= MAX_CLIENTS; ++i)
+                    if (p[i].fd == -1) {
+                        slot = i;
+                        break;
+                    }
+                if (slot == -1 || nonblock(client) == -1) {
+                    fprintf(stderr, "Client limit or nonblock error\n");
+                    close(client);
+                } else {
+                    p[slot].fd = client;
+                }
+            }
+        }
+        for (i = 1; i <= MAX_CLIENTS; ++i)
+            if (p[i].fd >= 0 &&
