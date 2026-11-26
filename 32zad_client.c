@@ -1,4 +1,4 @@
-/* Homework 32 client: send one character at a time with a short random pause.
+/* Homework 32 client: send one character at a time with independent random pauses.
  * Example: ./32zad_client 1 500
  *          ./32zad_client 2 500
  * Solaris: gcc -std=c99 -Wall -Wextra 32zad_client.c -o 32zad_client -lsocket -lnsl
@@ -31,9 +31,17 @@ static long parse_count(const char *text)
 static void pause_randomly(void)
 {
     struct timespec tm, rest;
-    /* Independent client timing: from 1 to 20 milliseconds, as in the example. */
+    int ms;
+
+    /* Uneven pauses between sends: mostly short, occasionally longer.
+       This creates naturally varying runs, not a hard-coded 1212 pattern. */
+    if (rand() % 18 == 0)
+        ms = 60 + rand() % 111;  /* 60..170 ms */
+    else
+        ms = 1 + rand() % 25;    /* 1..25 ms */
+
     tm.tv_sec = 0;
-    tm.tv_nsec = (1000000L * (1 + rand() % 20));
+    tm.tv_nsec = (long)ms * 1000000L;
     while (nanosleep(&tm, &rest) == -1 && errno == EINTR)
         tm = rest;
 }
