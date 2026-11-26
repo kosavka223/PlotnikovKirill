@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(__sun)
@@ -44,6 +45,17 @@ static volatile sig_atomic_t notified = 1;
 static volatile sig_atomic_t stopping = 0;
 static unsigned long ones = 0, twos = 0, chars_received = 0;
 static unsigned int column = 0;
+static struct timespec started_at;
+static struct timespec first_byte_at;
+static struct timespec last_byte_at;
+static int has_bytes = 0;
+
+static double elapsed_seconds(const struct timespec *from,
+                              const struct timespec *to)
+{
+    return (double)(to->tv_sec - from->tv_sec) +
+           (double)(to->tv_nsec - from->tv_nsec) / 1000000000.0;
+}
 
 static void on_ready(int sig)
 {
@@ -138,6 +150,15 @@ static void accept_all(int listener)
 
 static void output_byte(unsigned char ch)
 {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        if (!has_bytes) {
+            first_byte_at = now;
+            has_bytes = 1;
+        }
+        last_byte_at = now;
+    }
+
     ch = (unsigned char)toupper(ch);
     if (ch == '1') ++ones;
     if (ch == '2') ++twos;
@@ -195,6 +216,12 @@ int main(void)
     struct sockaddr_un addr;
     sigset_t blocked, original, waitmask;
     int listener, flags, i;
+    struct timespec finished_at;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &started_at) != 0) {
+        perror("clock_gettime");
+        return 1;
+    }
 
     for (i = 0; i < MAX_CLIENTS; ++i)
         clients[i].fd = -1;
@@ -297,6 +324,13 @@ int main(void)
     if (column)
         putchar('\n');
     printf("[SERVER] Total: 1=%lu, 2=%lu, all=%lu\n", ones, twos, chars_received);
+    if (clock_gettime(CLOCK_MONOTONIC, &finished_at) == 0) {
+        printf("[SERVER] Run time: %.2f seconds\n",
+               elapsed_seconds(&started_at, &finished_at));
+        if (has_bytes)
+            printf("[SERVER] Receiving time: %.2f seconds\n",
+                   elapsed_seconds(&first_byte_at, &last_byte_at));
+    }
     fflush(stdout);
     sigprocmask(SIG_SETMASK, &original, NULL);
     return 0;
