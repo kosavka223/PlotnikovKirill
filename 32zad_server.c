@@ -37,6 +37,8 @@ typedef struct {
     struct aiocb aio;
     char chunk[1024];
     int pending;
+    int stream_mode;
+    char stream_digit;
 } Client;
 
 static Client clients[MAX_CLIENTS];
@@ -44,6 +46,8 @@ static char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static volatile sig_atomic_t stopping = 0;
 static volatile sig_atomic_t io_ready = 1;
 static int bound = 0;
+static int stream_started = 0;
+static unsigned long long count_1 = 0, count_2 = 0, stream_output = 0;
 
 static long long clock_ns(void)
 {
@@ -121,16 +125,43 @@ static void print_message(Client *c, char *line)
     fflush(stdout);
 }
 
+/* Normal lines remain supported. The special header enables live stream mode. */
 static void consume_data(Client *c, int slot, ssize_t n)
 {
     size_t j;
     for (j = 0; j < (size_t)n; ++j) {
-        if (c->chunk[j] == '\n') {
+        unsigned char ch = (unsigned char)c->chunk[j];
+        if (c->stream_mode) {
+            /* Show the actual arrival order of bytes from both sockets. */
+            if (ch == (unsigned char)c->stream_digit) {
+                if (stream_output && stream_output % 70 == 0)
+                    putchar('\n');
+                putchar(ch);
+                ++stream_output;
+                if (ch == '1') ++count_1;
+                if (ch == '2') ++count_2;
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (ch == '\n') {
             c->line[c->used] = '\0';
-            print_message(c, c->line);
+            if (strncmp(c->line, "@STREAM|", 8) == 0 &&
+                (c->line[8] == '1' || c->line[8] == '2') &&
+                c->line[9] == '\0') {
+                c->stream_mode = 1;
+                c->stream_digit = c->line[8];
+                if (!stream_started) {
+                    stream_started = 1;
+                    puts("\n[SERVER] Incoming 1 and 2 (mixed in real time):");
+                    fflush(stdout);
+                }
+            } else {
+                print_message(c, c->line);
+            }
             c->used = 0;
         } else if (c->used + 1 < sizeof(c->line)) {
-            c->line[c->used++] = c->chunk[j];
+            c->line[c->used++] = (char)ch;
         } else {
             fprintf(stderr, "[SERVER] Message too long (client %d)\n", slot);
             c->used = 0;
@@ -163,6 +194,7 @@ static void close_client(Client *c, int slot)
     c->fd = -1;
     c->pending = 0;
     c->used = 0;
+    c->stream_mode = 0;
 }
 
 /* Check ALL asynchronous requests for completion, not one blocking read. */
@@ -230,6 +262,8 @@ static void drain_sockets(int listener)
         clients[slot].connected_ns = clock_ns();
         clients[slot].used = 0;
         clients[slot].pending = 0;
+        clients[slot].stream_mode = 0;
+        clients[slot].stream_digit = 0;
 
         if (submit_read(&clients[slot], slot) == -1)
             close_client(&clients[slot], slot);
@@ -320,6 +354,10 @@ int main(void)
             close(clients[i].fd);
         }
     close(listener);
+    if (stream_started) {
+        printf("\n[SERVER] Received: 1=%llu, 2=%llu\n", count_1, count_2);
+        fflush(stdout);
+    }
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
     return 0;
 }
