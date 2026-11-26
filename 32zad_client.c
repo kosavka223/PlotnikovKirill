@@ -1,6 +1,7 @@
 /* Task 32 client with a configurable pre-send delay for demonstrations.
  * Usage: ./32zad_client ID DELAY_MS "message"
  * Old syntax ./32zad_client "message" still works.
+ * Stream demo: ./32zad_client --stream 1 5000 30
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -56,8 +57,38 @@ int main(int argc, char **argv)
     long long sent_ns;
     char *end;
     int bytes;
+    int stream_mode = 0;
+    char stream_digit = 0;
+    long stream_duration_ms = 0, stream_interval_ms = 30;
+    long long stream_until;
 
-    if (argc == 2) {
+    if ((argc == 4 || argc == 5) && strcmp(argv[1], "--stream") == 0) {
+        if (strlen(argv[2]) != 1 ||
+            (argv[2][0] != '1' && argv[2][0] != '2')) {
+            fprintf(stderr, "Stream digit must be 1 or 2\n");
+            return 1;
+        }
+        stream_mode = 1;
+        stream_digit = argv[2][0];
+        errno = 0;
+        stream_duration_ms = strtol(argv[3], &end, 10);
+        if (errno || *end || stream_duration_ms < 100 ||
+            stream_duration_ms > 60000) {
+            fprintf(stderr, "DURATION_MS must be 100..60000\n");
+            return 1;
+        }
+        if (argc == 5) {
+            errno = 0;
+            stream_interval_ms = strtol(argv[4], &end, 10);
+            if (errno || *end || stream_interval_ms < 10 ||
+                stream_interval_ms > 1000) {
+                fprintf(stderr, "INTERVAL_MS must be 10..1000\n");
+                return 1;
+            }
+        }
+        snprintf(id, sizeof(id), "stream-%c", stream_digit);
+        message = "";
+    } else if (argc == 2) {
         snprintf(id, sizeof(id), "P%ld", (long)getpid());
         message = argv[1];
     } else if (argc == 4) {
@@ -75,7 +106,9 @@ int main(int argc, char **argv)
         message = argv[3];
     } else {
         fprintf(stderr, "Usage: %s ID DELAY_MS \"message\"\n"
-                        "   or: %s \"message\"\n", argv[0], argv[0]);
+                        "   or: %s \"message\"\n"
+                        "   or: %s --stream 1|2 DURATION_MS [INTERVAL_MS]\n",
+                argv[0], argv[0], argv[0]);
         return 1;
     }
     if (!*id || strchr(message, '\n') || strchr(message, '\r')) {
@@ -98,6 +131,28 @@ int main(int argc, char **argv)
         if (fd != -1)
             close(fd);
         return 1;
+    }
+    if (stream_mode) {
+        /* One socket stays open: send many separate 1-byte messages. */
+        char header[16];
+        int h = snprintf(header, sizeof(header), "@STREAM|%c\n", stream_digit);
+        if (h < 0 || h >= (int)sizeof(header) ||
+            write_all(fd, header, (size_t)h) < 0) {
+            perror("write stream header");
+            close(fd);
+            return 1;
+        }
+        stream_until = clock_ns() + (long long)stream_duration_ms * 1000000LL;
+        while (clock_ns() < stream_until) {
+            if (write_all(fd, &stream_digit, 1) == -1) {
+                perror("write stream byte");
+                close(fd);
+                return 1;
+            }
+            pause_ms(stream_interval_ms);
+        }
+        close(fd);
+        return 0;
     }
     printf("[CLIENT %s] Waiting %.1f s before sending...\n",
            id, delay / 1000.0);
