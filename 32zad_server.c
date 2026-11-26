@@ -1,6 +1,8 @@
-/* Homework 32. Unix domain socket + POSIX AIO (no select/poll).
- * The server prints each byte as soon as an asynchronous read completes.
- * On Solaris: gcc 32zad_server.c -o 32zad_server -lsocket -lnsl -lrt
+/* Homework 32: Unix domain socket, multiple clients, POSIX AIO.
+ * The server reads asynchronously (aio_read), without select/poll.
+ * Each received character is printed immediately in a common stream.
+ *
+ * Solaris: gcc -std=c99 -Wall -Wextra 32zad_server.c -o 32zad_server -lsocket -lnsl -lrt
  */
 #if defined(__sun)
 #define __EXTENSIONS__ 1
@@ -21,180 +23,177 @@
 
 #if defined(__sun)
 #include <sys/file.h>
-#define ASYNC_FLAG FASYNC
+#define SOCKET_ASYNC FASYNC
 #else
-#define ASYNC_FLAG O_ASYNC
+#define SOCKET_ASYNC O_ASYNC
 #endif
 
-#define MAX_CLIENTS 64
+#define MAX_CLIENTS 32
+#define LINE_WIDTH 80
 
 typedef struct {
     int fd;
-    int pending;
-    char byte;
-    struct aiocb cb;
+    int reading;
+    unsigned char byte;
+    struct aiocb request;
 } Client;
 
 static Client clients[MAX_CLIENTS];
 static char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-static volatile sig_atomic_t io_event = 1;
-static volatile sig_atomic_t stop_server = 0;
-static unsigned long long ones = 0, twos = 0;
-static int printed_any = 0;
+static volatile sig_atomic_t notified = 1;
+static volatile sig_atomic_t stopping = 0;
+static unsigned long ones = 0, twos = 0, chars_received = 0;
+static unsigned int column = 0;
 
-static void on_io(int sig)
+static void on_ready(int sig)
 {
     (void)sig;
-    io_event = 1;
+    notified = 1;
 }
 
 static void on_stop(int sig)
 {
     (void)sig;
-    stop_server = 1;
+    stopping = 1;
 }
 
-static void cleanup(void)
+static void remove_socket(void)
 {
-    unlink(socket_path);
+    if (socket_path[0])
+        unlink(socket_path);
 }
 
-/* Put one asynchronous read on a client socket. */
-static int start_read(Client *c)
+static int handler(int signo, void (*fn)(int))
 {
-    memset(&c->cb, 0, sizeof(c->cb));
-    c->cb.aio_fildes = c->fd;
-    c->cb.aio_buf = &c->byte;
-    c->cb.aio_nbytes = 1;
-    c->cb.aio_sigevent.sigev_notify = SIGEV_SIGNAL;
-    c->cb.aio_sigevent.sigev_signo = SIGUSR1;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = fn;
+    return sigaction(signo, &sa, NULL);
+}
 
-    if (aio_read(&c->cb) == -1) {
+static void close_client(Client *c)
+{
+    if (c->fd >= 0)
+        close(c->fd);
+    c->fd = -1;
+    c->reading = 0;
+}
+
+/* THIS IS THE MAIN ASYNCHRONOUS OPERATION. */
+static int queue_read(Client *c)
+{
+    memset(&c->request, 0, sizeof(c->request));
+    c->request.aio_fildes = c->fd;
+    c->request.aio_buf = &c->byte;
+    c->request.aio_nbytes = 1;
+    c->request.aio_sigevent.sigev_notify = SIGEV_SIGNAL;
+    c->request.aio_sigevent.sigev_signo = SIGUSR1;
+
+    if (aio_read(&c->request) == -1) {
         perror("aio_read");
         return -1;
     }
-    c->pending = 1;
+    c->reading = 1;
     return 0;
 }
 
-static void forget_client(Client *c)
-{
-    close(c->fd);
-    c->fd = -1;
-    c->pending = 0;
-}
-
-/* Accept every connection currently waiting. */
-static void accept_clients(int listener)
+static void accept_all(int listener)
 {
     for (;;) {
         int fd = accept(listener, NULL, NULL);
         int i;
-        int flags;
 
-        if (fd == -1) {
+        if (fd < 0) {
             if (errno == EINTR)
                 continue;
             if (errno != EAGAIN && errno != EWOULDBLOCK)
                 perror("accept");
-            break;
+            return;
         }
 
         for (i = 0; i < MAX_CLIENTS && clients[i].fd != -1; ++i)
             ;
         if (i == MAX_CLIENTS) {
-            fprintf(stderr, "[SERVER] Too many clients\n");
+            fprintf(stderr, "Too many clients\n");
             close(fd);
             continue;
         }
 
-        /* aio_read uses the connected socket; only the listener needs SIGIO. */
-        flags = fcntl(fd, F_GETFL, 0);
-        if (flags == -1 ||
-            fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
-            perror("fcntl client");
-            close(fd);
-            continue;
+        /* The listening socket is nonblocking; the connected one is used by AIO. */
+        {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags == -1 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+                perror("client fcntl");
+                close(fd);
+                continue;
+            }
         }
-
         clients[i].fd = fd;
-        clients[i].pending = 0;
-        if (start_read(&clients[i]) == -1)
-            forget_client(&clients[i]);
+        clients[i].reading = 0;
+        if (queue_read(&clients[i]) == -1)
+            close_client(&clients[i]);
     }
 }
 
-/* Collect all finished AIO operations without blocking on a slow client. */
-static void collect_reads(void)
+static void output_byte(unsigned char ch)
+{
+    ch = (unsigned char)toupper(ch);
+    if (ch == '1') ++ones;
+    if (ch == '2') ++twos;
+    ++chars_received;
+
+    /* Do not buffer the output: watch digits arrive live. */
+    if (write(STDOUT_FILENO, &ch, 1) < 0)
+        perror("stdout");
+
+    if (ch == '\n') {
+        column = 0;
+    } else if (++column >= LINE_WIDTH) {
+        (void)write(STDOUT_FILENO, "\n", 1);
+        column = 0;
+    }
+}
+
+static void collect_completed(void)
 {
     int i;
     for (i = 0; i < MAX_CLIENTS; ++i) {
         Client *c = &clients[i];
         int err;
         ssize_t n;
-        unsigned char ch;
 
-        if (c->fd == -1 || !c->pending)
+        if (c->fd < 0 || !c->reading)
             continue;
 
-        err = aio_error(&c->cb);
+        err = aio_error(&c->request);
         if (err == EINPROGRESS)
             continue;
-
-        n = aio_return(&c->cb);
-        c->pending = 0;
-        if (err != 0 || n <= 0) {
-            if (err != 0)
-                fprintf(stderr, "\n[SERVER] AIO error: %s\n", strerror(err));
-            forget_client(c);
+        if (err < 0) {
+            perror("aio_error");
+            close_client(c);
             continue;
         }
 
-        ch = (unsigned char)c->byte;
-        ch = (unsigned char)toupper(ch);
-        if (ch == '1')
-            ++ones;
-        if (ch == '2')
-            ++twos;
-
-        /* Live output: no imposed alternation between clients. */
-        if (write(STDOUT_FILENO, &ch, 1) == -1)
-            perror("stdout");
-        printed_any = 1;
-
-        if (start_read(c) == -1)
-            forget_client(c);
-    }
-
-    /* When all clients disconnect, finish the live line and show counts. */
-    if (printed_any && (ones != 0 || twos != 0)) {
-        int active = 0;
-        for (i = 0; i < MAX_CLIENTS; ++i)
-            if (clients[i].fd != -1)
-                ++active;
-        if (active == 0) {
-            printf("\n[SERVER] Finished: 1=%llu, 2=%llu\n", ones, twos);
-            fflush(stdout);
-            ones = 0;
-            twos = 0;
-            printed_any = 0;
+        n = aio_return(&c->request);
+        c->reading = 0;
+        if (err != 0 || n <= 0) {
+            if (err != 0)
+                fprintf(stderr, "AIO error: %s\n", strerror(err));
+            close_client(c);
+            continue;
         }
-    }
-}
 
-static int install_handler(int sig, void (*handler)(int))
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sigemptyset(&sa.sa_mask);
-    sa.sa_handler = handler;
-    return sigaction(sig, &sa, NULL);
+        output_byte(c->byte);
+        if (queue_read(c) == -1)
+            close_client(c);
+    }
 }
 
 int main(void)
 {
     struct sockaddr_un addr;
-    sigset_t signals, oldmask, waitmask;
+    sigset_t blocked, original, waitmask;
     int listener, flags, i;
 
     for (i = 0; i < MAX_CLIENTS; ++i)
@@ -205,42 +204,53 @@ int main(void)
     if (snprintf(socket_path, sizeof(socket_path),
                  "/tmp/hw32_%lu.sock", (unsigned long)getuid()) >=
         (int)sizeof(socket_path)) {
-        fprintf(stderr, "Socket name is too long\n");
+        fprintf(stderr, "Socket path is too long\n");
         return 1;
     }
     strcpy(addr.sun_path, socket_path);
 
-    sigemptyset(&signals);
-    sigaddset(&signals, SIGIO);
-    sigaddset(&signals, SIGUSR1);
-    sigaddset(&signals, SIGINT);
-    sigaddset(&signals, SIGTERM);
-    if (sigprocmask(SIG_BLOCK, &signals, &oldmask) == -1) {
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGIO);
+    sigaddset(&blocked, SIGUSR1);
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &blocked, &original) == -1) {
         perror("sigprocmask");
         return 1;
     }
-
-    waitmask = oldmask;
+    waitmask = original;
     sigdelset(&waitmask, SIGIO);
     sigdelset(&waitmask, SIGUSR1);
     sigdelset(&waitmask, SIGINT);
     sigdelset(&waitmask, SIGTERM);
 
-    if (install_handler(SIGIO, on_io) == -1 ||
-        install_handler(SIGUSR1, on_io) == -1 ||
-        install_handler(SIGINT, on_stop) == -1 ||
-        install_handler(SIGTERM, on_stop) == -1) {
+    if (handler(SIGIO, on_ready) == -1 ||
+        handler(SIGUSR1, on_ready) == -1 ||
+        handler(SIGINT, on_stop) == -1 ||
+        handler(SIGTERM, on_stop) == -1) {
         perror("sigaction");
         return 1;
     }
 
     listener = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (listener == -1) {
+    if (listener < 0) {
         perror("socket");
         return 1;
     }
 
-    /* For this exercise only one instance of the server should run. */
+    /* Reject another copy of the server; clean only a stale socket file. */
+    {
+        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (probe >= 0) {
+            if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                fprintf(stderr, "Server already running. Stop it first.\n");
+                close(probe);
+                close(listener);
+                return 1;
+            }
+            close(probe);
+        }
+    }
     unlink(socket_path);
     if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) == -1 ||
         listen(listener, MAX_CLIENTS) == -1) {
@@ -248,46 +258,46 @@ int main(void)
         close(listener);
         return 1;
     }
-    if (atexit(cleanup) != 0) {
+    if (atexit(remove_socket) != 0) {
         close(listener);
         return 1;
     }
 
     flags = fcntl(listener, F_GETFL, 0);
-    if (flags == -1 ||
+    if (flags < 0 ||
         fcntl(listener, F_SETOWN, getpid()) == -1 ||
-        fcntl(listener, F_SETFL, flags | O_NONBLOCK | ASYNC_FLAG) == -1) {
-        perror("fcntl async listener");
+        fcntl(listener, F_SETFL, flags | O_NONBLOCK | SOCKET_ASYNC) == -1) {
+        perror("async listener fcntl");
         close(listener);
         return 1;
     }
 
-    puts("[SERVER] Waiting for clients. Live incoming characters:");
+    puts("[SERVER] AIO: incoming characters (live):");
     fflush(stdout);
 
-    /* Signals are blocked except during sigsuspend(). */
-    while (!stop_server) {
-        if (io_event) {
-            io_event = 0;
-            accept_clients(listener);
-            collect_reads();
+    /* No poll() / select(): wake only when SIGIO / SIGUSR1 arrives. */
+    while (!stopping) {
+        if (notified) {
+            notified = 0;
+            accept_all(listener);
+            collect_completed();
         }
-        if (!stop_server && !io_event)
+        if (!notified && !stopping)
             sigsuspend(&waitmask);
     }
 
     for (i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i].fd != -1) {
-            if (clients[i].pending)
-                aio_cancel(clients[i].fd, &clients[i].cb);
-            close(clients[i].fd);
+        if (clients[i].fd >= 0) {
+            if (clients[i].reading)
+                aio_cancel(clients[i].fd, &clients[i].request);
+            close_client(&clients[i]);
         }
     }
     close(listener);
-    if (printed_any && (ones != 0 || twos != 0)) {
+    if (column)
         putchar('\n');
-        printf("[SERVER] Received: 1=%llu, 2=%llu\n", ones, twos);
-    }
-    sigprocmask(SIG_SETMASK, &oldmask, NULL);
+    printf("[SERVER] Total: 1=%lu, 2=%lu, all=%lu\n", ones, twos, chars_received);
+    fflush(stdout);
+    sigprocmask(SIG_SETMASK, &original, NULL);
     return 0;
 }
