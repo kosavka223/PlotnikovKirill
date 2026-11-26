@@ -1,24 +1,52 @@
+/* Task 32 client with a configurable pre-send delay for demonstrations.
+ * Usage: ./32zad_client ID DELAY_MS "message"
+ * Old syntax ./32zad_client "message" still works.
+ */
 #define _POSIX_C_SOURCE 200809L
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
-static int write_all(int fd, const char *buf, size_t n)
+static long long clock_ns(void)
 {
-    while (n) {
-        ssize_t k = write(fd, buf, n);
-        if (k < 0 && errno == EINTR)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
+        perror("clock_gettime");
+        exit(1);
+    }
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static double elapsed_ms(long long earlier)
+{
+    return (double)(clock_ns() - earlier) / 1000000.0;
+}
+
+static void pause_ms(long ms)
+{
+    struct timespec request, leftover;
+    request.tv_sec = ms / 1000;
+    request.tv_nsec = (ms % 1000) * 1000000L;
+    while (nanosleep(&request, &leftover) == -1 && errno == EINTR)
+        request = leftover;
+}
+
+static int write_all(int fd, const char *s, size_t len)
+{
+    while (len) {
+        ssize_t n = write(fd, s, len);
+        if (n < 0 && errno == EINTR)
             continue;
-        if (k <= 0)
+        if (n <= 0)
             return -1;
-        buf += k;
-        n -= (size_t)k;
+        s += n;
+        len -= (size_t)n;
     }
     return 0;
 }
@@ -26,57 +54,81 @@ static int write_all(int fd, const char *buf, size_t n)
 int main(int argc, char **argv)
 {
     struct sockaddr_un addr;
-    int sock, i, rc = 0;
-    char buf[4096];
-    ssize_t n;
+    int fd;
+    long delay = 0;
+    char id[32], packet[1800];
+    const char *message;
+    long long start, sent_ns;
+    char *end;
+    int bytes;
+
+    if (argc == 2) {
+        snprintf(id, sizeof(id), "P%ld", (long)getpid());
+        message = argv[1];
+    } else if (argc == 4) {
+        if (strlen(argv[1]) >= sizeof(id) || strchr(argv[1], '|')) {
+            fprintf(stderr, "Client ID too long or contains '|'\n");
+            return 1;
+        }
+        strcpy(id, argv[1]);
+        errno = 0;
+        delay = strtol(argv[2], &end, 10);
+        if (errno || *end || delay < 0 || delay > 30000) {
+            fprintf(stderr, "DELAY_MS must be 0..30000\n");
+            return 1;
+        }
+        message = argv[3];
+    } else {
+        fprintf(stderr, "Usage: %s ID DELAY_MS \"message\"\n"
+                        "   or: %s \"message\"\n", argv[0], argv[0]);
+        return 1;
+    }
+    if (!*id || strchr(message, '\n') || strchr(message, '\r')) {
+        fprintf(stderr, "Use a nonempty ID and a one-line message\n");
+        return 1;
+    }
 
     signal(SIGPIPE, SIG_IGN);
-    memset(&addr, 0, sizeof addr);
+    memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    if (snprintf(addr.sun_path, sizeof addr.sun_path,
+    if (snprintf(addr.sun_path, sizeof(addr.sun_path),
                  "/tmp/hw32_%lu.sock", (unsigned long)getuid()) >=
-        (int)sizeof addr.sun_path) {
+        (int)sizeof(addr.sun_path)) {
         fprintf(stderr, "Socket path too long\n");
         return 1;
     }
-    sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock == -1) {
-        perror("socket");
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd == -1 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("socket/connect (start server first)");
+        if (fd != -1)
+            close(fd);
         return 1;
     }
-    if (connect(sock, (struct sockaddr *)&addr, sizeof addr) == -1) {
-        perror("connect (start the server first)");
-        close(sock);
-        return 1;
-    }
+    start = clock_ns();
+    printf("[CLIENT %-7s pid=%-6ld] CONNECTED; artificial delay=%ld ms\n",
+           id, (long)getpid(), delay);
+    fflush(stdout);
 
-    if (argc > 1) {
-        /* Command-line text, separated by spaces. */
-        for (i = 1; i < argc; ++i) {
-            if (write_all(sock, argv[i], strlen(argv[i])) == -1 ||
-                write_all(sock, i == argc - 1 ? "\n" : " ", 1) == -1) {
-                perror("send");
-                rc = 1;
-                break;
-            }
-        }
-    } else {
-        /* Interactive input: Ctrl+D on an empty line ends input. */
-        while ((n = read(STDIN_FILENO, buf, sizeof buf)) != 0) {
-            if (n < 0) {
-                if (errno == EINTR)
-                    continue;
-                perror("stdin read");
-                rc = 1;
-                break;
-            }
-            if (write_all(sock, buf, (size_t)n) == -1) {
-                perror("send");
-                rc = 1;
-                break;
-            }
-        }
+    pause_ms(delay);  /* Only the CLIENT waits; the SERVER does not sleep. */
+    sent_ns = clock_ns();
+    bytes = snprintf(packet, sizeof(packet), "@%ld|%lld|%s|%s\n",
+                     (long)getpid(), sent_ns, id, message);
+    if (bytes < 0 || bytes >= (int)sizeof(packet)) {
+        fprintf(stderr, "Message too long\n");
+        close(fd);
+        return 1;
     }
-    close(sock); /* The server sees EOF. */
-    return rc;
+    printf("[CLIENT %-7s pid=%-6ld] SEND after %.1f ms: %s\n",
+           id, (long)getpid(), elapsed_ms(start), message);
+    fflush(stdout);
+    if (write_all(fd, packet, (size_t)bytes) == -1) {
+        perror("write");
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    printf("[CLIENT %-7s pid=%-6ld] CLOSED; total %.1f ms\n",
+           id, (long)getpid(), elapsed_ms(start));
+    fflush(stdout);
+    return 0;
 }
