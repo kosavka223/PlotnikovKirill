@@ -1,10 +1,7 @@
-/* Homework 32 client.
- * Send 10 ones, one every 500 ms:
- *   ./32zad_client --chars 1 10 500
- * Send 20 twos, one every 500 ms:
- *   ./32zad_client --chars 2 20 500
- * Ordinary text (also needed by the assignment):
- *   ./32zad_client "Hello WoRLd"
+/* Homework 32 client: send one character at a time with a short random pause.
+ * Example: ./32zad_client 1 500
+ *          ./32zad_client 2 500
+ * Solaris: gcc -std=c99 -Wall -Wextra 32zad_client.c -o 32zad_client -lsocket -lnsl
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -18,106 +15,93 @@
 #include <time.h>
 #include <unistd.h>
 
-static int send_all(int fd, const char *s, size_t len)
-{
-    while (len > 0) {
-        ssize_t n = write(fd, s, len);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return -1;
-        s += n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static void pause_ms(long ms)
-{
-    struct timespec t, rest;
-    t.tv_sec = ms / 1000;
-    t.tv_nsec = (ms % 1000) * 1000000L;
-    while (nanosleep(&t, &rest) == -1 && errno == EINTR)
-        t = rest;
-}
-
-static long read_number(const char *s, long min, long max)
+static long parse_count(const char *text)
 {
     char *end;
-    long value;
+    long n;
     errno = 0;
-    value = strtol(s, &end, 10);
-    if (errno || !*s || *end || value < min || value > max) {
-        fprintf(stderr, "Invalid number: %s (expected %ld..%ld)\n",
-                s, min, max);
+    n = strtol(text, &end, 10);
+    if (errno || !*text || *end || n < 1 || n > 1000000) {
+        fprintf(stderr, "Count must be between 1 and 1000000\n");
         exit(1);
     }
-    return value;
+    return n;
+}
+
+static void pause_randomly(void)
+{
+    struct timespec tm, rest;
+    /* Independent client timing: from 1 to 20 milliseconds, as in the example. */
+    tm.tv_sec = 0;
+    tm.tv_nsec = (1000000L * (1 + rand() % 20));
+    while (nanosleep(&tm, &rest) == -1 && errno == EINTR)
+        tm = rest;
+}
+
+static int send_byte(int fd, char ch)
+{
+    ssize_t n;
+    do {
+        n = write(fd, &ch, 1);
+    } while (n == -1 && errno == EINTR);
+    return n == 1 ? 0 : -1;
 }
 
 int main(int argc, char **argv)
 {
     struct sockaddr_un addr;
+    struct timespec t;
     int fd;
-    int stream = 0;
-    char ch = 0;
-    long count = 0, interval_ms = 0, i;
+    unsigned int seed;
+    long i, count;
+    char ch;
 
-    if (argc == 5 && strcmp(argv[1], "--chars") == 0) {
-        if (strlen(argv[2]) != 1 ||
-            (argv[2][0] != '1' && argv[2][0] != '2')) {
-            fprintf(stderr, "Use digit 1 or 2\n");
-            return 1;
-        }
-        stream = 1;
-        ch = argv[2][0];
-        count = read_number(argv[3], 1, 10000);
-        interval_ms = read_number(argv[4], 1, 60000);
-    } else if (argc != 2) {
-        fprintf(stderr,
-                "Usage: %s --chars 1|2 COUNT INTERVAL_MS\n"
-                "   or: %s \"Hello WoRLd\"\n", argv[0], argv[0]);
+    if (argc != 3 || strlen(argv[1]) != 1) {
+        fprintf(stderr, "Usage: %s CHARACTER COUNT\n"
+                        "Example: %s 1 500\n", argv[0], argv[0]);
+        return 1;
+    }
+    ch = argv[1][0];
+    count = parse_count(argv[2]);
+    if (ch < 32 || ch > 126) {
+        fprintf(stderr, "Use one printable ASCII character\n");
         return 1;
     }
 
+    if (clock_gettime(CLOCK_REALTIME, &t) == -1)
+        t.tv_nsec = 0;
+    seed = (unsigned int)(t.tv_nsec ^ (unsigned long)getpid());
+    srand(seed);
     signal(SIGPIPE, SIG_IGN);
+
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     if (snprintf(addr.sun_path, sizeof(addr.sun_path),
                  "/tmp/hw32_%lu.sock", (unsigned long)getuid()) >=
         (int)sizeof(addr.sun_path)) {
-        fprintf(stderr, "Socket name is too long\n");
+        fprintf(stderr, "Socket path too long\n");
         return 1;
     }
 
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd == -1) {
+    if (fd < 0) {
         perror("socket");
         return 1;
     }
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        perror("connect (start the server first)");
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect (start server first)");
         close(fd);
         return 1;
     }
 
-    if (stream) {
-        for (i = 0; i < count; ++i) {
-            if (send_all(fd, &ch, 1) == -1) {
-                perror("send");
-                close(fd);
-                return 1;
-            }
-            if (i + 1 < count)
-                pause_ms(interval_ms);
-        }
-    } else {
-        if (send_all(fd, argv[1], strlen(argv[1])) == -1 ||
-            send_all(fd, "\n", 1) == -1) {
-            perror("send");
+    for (i = 0; i < count; ++i) {
+        if (send_byte(fd, ch) == -1) {
+            perror("write");
             close(fd);
             return 1;
         }
+        if (i + 1 < count)
+            pause_randomly();
     }
 
     close(fd);
