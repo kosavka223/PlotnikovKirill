@@ -23,11 +23,6 @@ static long long clock_ns(void)
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static double elapsed_ms(long long earlier)
-{
-    return (double)(clock_ns() - earlier) / 1000000.0;
-}
-
 static void pause_ms(long ms)
 {
     struct timespec request, leftover;
@@ -58,7 +53,7 @@ int main(int argc, char **argv)
     long delay = 0;
     char id[32], packet[1800];
     const char *message;
-    long long start, sent_ns;
+    long long sent_ns;
     char *end;
     int bytes;
 
@@ -104,12 +99,13 @@ int main(int argc, char **argv)
             close(fd);
         return 1;
     }
-    start = clock_ns();
-    printf("[CLIENT %-7s pid=%-6ld] CONNECTED; artificial delay=%ld ms\n",
-           id, (long)getpid(), delay);
+    printf("[CLIENT %s] Waiting %.1f s before sending...\n",
+           id, delay / 1000.0);
     fflush(stdout);
 
     pause_ms(delay);  /* Only the CLIENT waits; the SERVER does not sleep. */
+    printf("[CLIENT %s] Sending: %s\n", id, message);
+    fflush(stdout);
     sent_ns = clock_ns();
     bytes = snprintf(packet, sizeof(packet), "@%ld|%lld|%s|%s\n",
                      (long)getpid(), sent_ns, id, message);
@@ -118,17 +114,11 @@ int main(int argc, char **argv)
         close(fd);
         return 1;
     }
-    printf("[CLIENT %-7s pid=%-6ld] SEND after %.1f ms: %s\n",
-           id, (long)getpid(), elapsed_ms(start), message);
-    fflush(stdout);
     if (write_all(fd, packet, (size_t)bytes) == -1) {
         perror("write");
         close(fd);
         return 1;
     }
     close(fd);
-    printf("[CLIENT %-7s pid=%-6ld] CLOSED; total %.1f ms\n",
-           id, (long)getpid(), elapsed_ms(start));
-    fflush(stdout);
     return 0;
 }
