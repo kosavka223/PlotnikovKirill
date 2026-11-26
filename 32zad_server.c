@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <stdarg.h>
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -42,11 +41,8 @@ typedef struct {
 
 static Client clients[MAX_CLIENTS];
 static char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-static long long started_ns;
 static volatile sig_atomic_t stopping = 0;
 static volatile sig_atomic_t io_ready = 1;
-static volatile sig_atomic_t sigio_count = 0;
-static volatile sig_atomic_t aio_count = 0;
 static int bound = 0;
 
 static long long clock_ns(void)
@@ -64,30 +60,16 @@ static double elapsed_ms(long long from, long long to)
     return (double)(to - from) / 1000000.0;
 }
 
-static void trace(const char *fmt, ...)
-{
-    va_list ap;
-    printf("[SERVER +%8.1f ms pid=%ld] ",
-           elapsed_ms(started_ns, clock_ns()), (long)getpid());
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
-    putchar('\n');
-    fflush(stdout);
-}
-
 static void on_sigio(int sig)
 {
     (void)sig;
     io_ready = 1;
-    ++sigio_count; /* No printf(), malloc(), or clock_gettime() here. */
 }
 
 static void on_aio(int sig)
 {
     (void)sig;
     io_ready = 1;
-    ++aio_count;
 }
 
 static void on_stop(int sig)
@@ -110,28 +92,33 @@ static int make_async(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK | ASYNC_MODE);
 }
 
+/* One short line per message; no technical AIO trace spam. */
 static void print_message(Client *c, char *line)
 {
     long pid;
     long long sent_ns;
     char label[32], message[1500];
-    long long received_ns = clock_ns();
+    long long now = clock_ns();
+    double since_connect = elapsed_ms(c->connected_ns, now) / 1000.0;
     size_t j;
 
-    /* Client protocol: @PID|monotonic_send_ns|ID|message */
+    /* The demo client sends @PID|SEND_TIME|ID|TEXT. */
     if (sscanf(line, "@%ld|%lld|%31[^|]|%1499[^\r\n]",
                &pid, &sent_ns, label, message) == 4) {
+        double delivery_ms = elapsed_ms(sent_ns, now);
+        (void)pid;
         for (j = 0; message[j] != '\0'; ++j)
             message[j] = (char)toupper((unsigned char)message[j]);
-        trace("CLIENT %-7s pid=%-6ld  since-connect=%7.1f ms  "
-              "send->recv=%7.3f ms  TEXT: %s",
-              label, pid, elapsed_ms(c->connected_ns, received_ns),
-              elapsed_ms(sent_ns, received_ns), message);
-    } else { /* Old clients remain usable. */
+        if (delivery_ms < 0)
+            delivery_ms = 0;
+        printf("[SERVER] %s: %s | waited %.1f s, delivery %.2f ms\n",
+               label, message, since_connect, delivery_ms);
+    } else { /* Also accept ordinary one-line text. */
         for (j = 0; line[j] != '\0'; ++j)
             line[j] = (char)toupper((unsigned char)line[j]);
-        trace("CLIENT (legacy) TEXT: %s", line);
+        printf("[SERVER] Received: %s\n", line);
     }
+    fflush(stdout);
 }
 
 static void consume_data(Client *c, int slot, ssize_t n)
@@ -145,7 +132,7 @@ static void consume_data(Client *c, int slot, ssize_t n)
         } else if (c->used + 1 < sizeof(c->line)) {
             c->line[c->used++] = c->chunk[j];
         } else {
-            trace("WARNING: line too long; resetting slot=%d", slot);
+            fprintf(stderr, "[SERVER] Message too long (client %d)\n", slot);
             c->used = 0;
         }
     }
@@ -165,15 +152,13 @@ static int submit_read(Client *c, int slot)
         return -1;
     }
     c->pending = 1;
-    trace("AIO_QUEUED slot=%d fd=%d (continues without waiting)",
-          slot, c->fd);
+    (void)slot;
     return 0;
 }
 
 static void close_client(Client *c, int slot)
 {
-    trace("DISCONNECT slot=%d lived=%.1f ms", slot,
-          elapsed_ms(c->connected_ns, clock_ns()));
+    (void)slot;
     close(c->fd);
     c->fd = -1;
     c->pending = 0;
@@ -196,7 +181,8 @@ static void check_completions(void)
         n = aio_return(&c->aio);
         c->pending = 0;
         if (status != 0 || n < 0) {
-            trace("AIO_ERROR slot=%d error=%s", i, strerror(status));
+            fprintf(stderr, "[SERVER] AIO error (client %d): %s\n",
+                    i, strerror(status));
             close_client(c, i);
         } else if (n == 0) {
             if (c->used) {
@@ -205,7 +191,7 @@ static void check_completions(void)
             }
             close_client(c, i);
         } else {
-            trace("AIO_COMPLETED slot=%d bytes=%ld", i, (long)n);
+
             consume_data(c, i, n);
             if (submit_read(c, i) == -1)
                 close_client(c, i);
@@ -229,7 +215,7 @@ static void drain_sockets(int listener)
         for (i = 0; i < MAX_CLIENTS; ++i)
             if (clients[i].fd == -1) { slot = i; break; }
         if (slot < 0) {
-            trace("REFUSE: no client slots");
+            fprintf(stderr, "[SERVER] Too many clients\n");
             close(fd);
             continue;
         }
@@ -244,7 +230,7 @@ static void drain_sockets(int listener)
         clients[slot].connected_ns = clock_ns();
         clients[slot].used = 0;
         clients[slot].pending = 0;
-        trace("ACCEPT slot=%d fd=%d", slot, fd);
+
         if (submit_read(&clients[slot], slot) == -1)
             close_client(&clients[slot], slot);
     }
@@ -257,9 +243,7 @@ int main(void)
     struct sockaddr_un addr;
     struct sigaction action;
     sigset_t blocked, oldmask, waitmask;
-    sig_atomic_t seen = 0, aio_seen = 0;
 
-    started_ns = clock_ns();
     for (i = 0; i < MAX_CLIENTS; ++i)
         clients[i].fd = -1;
 
@@ -319,28 +303,16 @@ int main(void)
     bound = 1;
     atexit(cleanup);
 
-    trace("START: POSIX aio_read() + SIGUSR1, SIGIO for accept; no poll/select");
-    trace("SOCKET: %s; capacity=%d; awaiting clients", socket_path,
-          MAX_CLIENTS);
+    puts("[SERVER] Waiting for messages...");
+    fflush(stdout);
     while (!stopping) {
         if (io_ready) {
             io_ready = 0;
-            if (sigio_count != seen) {
-                trace("SIGIO received: total=%d (signals can coalesce)",
-                      (int)sigio_count);
-                seen = sigio_count;
-            }
-            if (aio_count != aio_seen) {
-                trace("AIO completion notifications via SIGUSR1 total=%d",
-                      (int)aio_count);
-                aio_seen = aio_count;
-            }
             drain_sockets(listener);
         }
         if (!stopping)
             sigsuspend(&waitmask);
     }
-    trace("STOP; closing sockets");
     for (i = 0; i < MAX_CLIENTS; ++i)
         if (clients[i].fd != -1) {
             if (clients[i].pending)
